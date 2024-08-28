@@ -24,6 +24,7 @@
 import numpy as np
 import torch
 import torch.cuda
+import torch.nn.functional
 from numba import jit, prange
 from torch.autograd import Function
 from numba import cuda
@@ -41,6 +42,15 @@ def compute_softdtw_cuda(D, gamma, bandwidth, max_i, max_j, n_passes, R):
     # We have as many threads as seq_len, because the most number of threads we need
     # is equal to the number of elements on the largest anti-diagonal
     tid = cuda.threadIdx.x
+
+    max_i = max_i[b].item()
+    max_j = max_j[b].item()
+    tpb = max(max_i, max_j)
+
+    if tid >= tpb:
+        return
+
+    n_passes = 2 * tpb - 1
 
     # Compute I, J, the indices from [0, seq_len)
 
@@ -79,6 +89,15 @@ def compute_softdtw_cuda(D, gamma, bandwidth, max_i, max_j, n_passes, R):
 def compute_softdtw_backward_cuda(D, R, inv_gamma, bandwidth, max_i, max_j, n_passes, E):
     k = cuda.blockIdx.x
     tid = cuda.threadIdx.x
+    
+    max_i = max_i[k].item()
+    max_j = max_j[k].item()
+    tpb = max(max_i, max_j)
+    
+    if tid >= tpb:
+        return
+    
+    n_passes = 2 * tpb - 1
 
     # Indexing logic is the same as above, however, the anti-diagonal needs to
     # progress backwards
@@ -118,11 +137,16 @@ class _SoftDTWCUDA(Function):
     """
 
     @staticmethod
-    def forward(ctx, D, gamma, bandwidth):
+    def forward(ctx, D, gamma, bandwidth, x_lens=None, y_lens=None):
         dev = D.device
         dtype = D.dtype
         gamma = torch.cuda.FloatTensor([gamma])
         bandwidth = torch.cuda.FloatTensor([bandwidth])
+
+        if x_lens is None:
+            x_lens = torch.ones(B, dtype=torch.long, device=dev) * N
+        if y_lens is None:
+            y_lens = torch.ones(B, dtype=torch.long, device=dev) * M
 
         B = D.shape[0]
         N = D.shape[1]
@@ -138,16 +162,17 @@ class _SoftDTWCUDA(Function):
         # Set CUDA's grid size to be equal to the batch size (every CUDA block processes one sample pair)
         # Set the CUDA block size to be equal to the length of the longer sequence (equal to the size of the largest diagonal)
         compute_softdtw_cuda[B, threads_per_block](cuda.as_cuda_array(D.detach()),
-                                                   gamma.item(), bandwidth.item(), N, M, n_passes,
+                                                   gamma.item(), bandwidth.item(), x_lens, y_lens, n_passes,
                                                    cuda.as_cuda_array(R))
-        ctx.save_for_backward(D, R.clone(), gamma, bandwidth)
-        return R[:, -2, -2]
+        ctx.save_for_backward(D, R.clone(), gamma, bandwidth, x_lens, y_lens)
+        
+        return R[torch.arange(B), x_lens, y_lens]
 
     @staticmethod
     def backward(ctx, grad_output):
         dev = grad_output.device
         dtype = grad_output.dtype
-        D, R, gamma, bandwidth = ctx.saved_tensors
+        D, R, gamma, bandwidth, x_lens, y_lens = ctx.saved_tensors
 
         B = D.shape[0]
         N = D.shape[1]
@@ -156,22 +181,29 @@ class _SoftDTWCUDA(Function):
         n_passes = 2 * threads_per_block - 1
 
         D_ = torch.zeros((B, N + 2, M + 2), dtype=dtype, device=dev)
-        D_[:, 1:N + 1, 1:M + 1] = D
-
-        R[:, :, -1] = -math.inf
-        R[:, -1, :] = -math.inf
-        R[:, -1, -1] = R[:, -2, -2]
-
         E = torch.zeros((B, N + 2, M + 2), dtype=dtype, device=dev)
-        E[:, -1, -1] = 1
+        for b, (n, m) in enumerate(zip(x_lens, y_lens)):
+            D_[b, 1:n + 1, 1:m + 1] = D[b, :n, :m]
+            R[b, :, m+1:] = -math.inf
+            R[b, n+1:, :] = -math.inf
+            R[b, n+1:, m+1:] = R[b, n, m]
+            E[b, n+1:, m+1:] = 1
+
+        # R[:, :, -1] = -math.inf
+        # R[:, -1, :] = -math.inf
+        # R[:, -1, -1] = R[:, -2, -2]
+
+        
+        # E[:, -1, -1] = 1
 
         # Grid and block sizes are set same as done above for the forward() call
         compute_softdtw_backward_cuda[B, threads_per_block](cuda.as_cuda_array(D_),
                                                             cuda.as_cuda_array(R),
-                                                            1.0 / gamma.item(), bandwidth.item(), N, M, n_passes,
+                                                            1.0 / gamma.item(), bandwidth.item(), cuda.as_cuda_array(x_lens), cuda.as_cuda_array(y_lens), n_passes,
                                                             cuda.as_cuda_array(E))
         E = E[:, 1:N + 1, 1:M + 1]
-        return grad_output.view(-1, 1, 1).expand_as(E) * E, None, None
+        # print(E[1], flush=True)
+        return grad_output.view(-1, 1, 1).expand_as(E) * E, None, None, None, None
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -292,10 +324,19 @@ class SoftDTW(torch.nn.Module):
         self.use_cuda = use_cuda
 
         # Set the distance function
-        if dist_func is not None:
+        
+        if isinstance(dist_func, str):
+            if dist_func == 'cosine':
+                self.dist_func = SoftDTW._cosine_dist_func
+            elif dist_func == 'euclidean':
+                self.dist_func = SoftDTW._euclidean_dist_func
+            else:
+                raise ValueError(f"Unknown distance function: {dist_func}")
+        elif dist_func is not None:
             self.dist_func = dist_func
         else:
             self.dist_func = SoftDTW._euclidean_dist_func
+        
 
     def _get_func_dtw(self, x, y):
         """
@@ -327,8 +368,20 @@ class SoftDTW(torch.nn.Module):
         x = x.unsqueeze(2).expand(-1, n, m, d)
         y = y.unsqueeze(1).expand(-1, n, m, d)
         return torch.pow(x - y, 2).sum(3)
+    
+    @staticmethod
+    def _cosine_dist_func(x, y):
+        """
+        Calculates the cosine distance between each element in x and y per timestep
+        """
+        n = x.size(1)
+        m = y.size(1)
+        d = x.size(2)
+        x = x.unsqueeze(2).expand(-1, n, m, d)
+        y = y.unsqueeze(1).expand(-1, n, m, d)
+        return 1 - torch.nn.functional.cosine_similarity(x, y, dim=3)
 
-    def forward(self, X, Y):
+    def forward(self, X, Y, X_mask=None, Y_mask=None):
         """
         Compute the soft-DTW value between X and Y
         :param X: One batch of examples, batch_size x seq_len x dims
@@ -338,91 +391,26 @@ class SoftDTW(torch.nn.Module):
 
         # Check the inputs and get the correct implementation
         func_dtw = self._get_func_dtw(X, Y)
-
+        
+        if X_mask is None:
+            X_mask = torch.ones(X.size(0), X.size(1), dtype=torch.bool, device=X.device)
+        if Y_mask is None:
+            Y_mask = torch.ones(Y.size(0), Y.size(1), dtype=torch.bool, device=Y.device)
+        D_mask = X_mask.unsqueeze(2) & Y_mask.unsqueeze(1)
+        D_pad_mask = (~X_mask).unsqueeze(2) & (~Y_mask).unsqueeze(1)
+        
         if self.normalize:
             # Stack everything up and run
             x = torch.cat([X, X, Y])
             y = torch.cat([Y, X, Y])
             D = self.dist_func(x, y)
+            
             out = func_dtw(D, self.gamma, self.bandwidth)
             out_xy, out_xx, out_yy = torch.split(out, X.shape[0])
             return out_xy - 1 / 2 * (out_xx + out_yy)
         else:
             D_xy = self.dist_func(X, Y)
-            return func_dtw(D_xy, self.gamma, self.bandwidth)
+            D_xy = D_xy.masked_fill(~D_mask, float('inf'))
+            D_xy = D_xy.masked_fill(D_pad_mask, 0.0)
+            return func_dtw(D_xy, self.gamma, self.bandwidth, X_mask.sum(1), Y_mask.sum(1))
 
-# ----------------------------------------------------------------------------------------------------------------------
-def timed_run(a, b, sdtw):
-    """
-    Runs a and b through sdtw, and times the forward and backward passes.
-    Assumes that a requires gradients.
-    :return: timing, forward result, backward result
-    """
-    from timeit import default_timer as timer
-
-    # Forward pass
-    start = timer()
-    forward = sdtw(a, b)
-    end = timer()
-    t = end - start
-
-    grad_outputs = torch.ones_like(forward)
-
-    # Backward
-    start = timer()
-    grads = torch.autograd.grad(forward, a, grad_outputs=grad_outputs)[0]
-    end = timer()
-
-    # Total time
-    t += end - start
-
-    return t, forward, grads
-
-# ----------------------------------------------------------------------------------------------------------------------
-def profile(batch_size, seq_len_a, seq_len_b, dims, tol_backward):
-    sdtw = SoftDTW(False, gamma=1.0, normalize=False)
-    sdtw_cuda = SoftDTW(True, gamma=1.0, normalize=False)
-    n_iters = 6
-
-    print("Profiling forward() + backward() times for batch_size={}, seq_len_a={}, seq_len_b={}, dims={}...".format(batch_size, seq_len_a, seq_len_b, dims))
-
-    times_cpu = []
-    times_gpu = []
-
-    for i in range(n_iters):
-        a_cpu = torch.rand((batch_size, seq_len_a, dims), requires_grad=True)
-        b_cpu = torch.rand((batch_size, seq_len_b, dims))
-        a_gpu = a_cpu.cuda()
-        b_gpu = b_cpu.cuda()
-
-        # GPU
-        t_gpu, forward_gpu, backward_gpu = timed_run(a_gpu, b_gpu, sdtw_cuda)
-
-        # CPU
-        t_cpu, forward_cpu, backward_cpu = timed_run(a_cpu, b_cpu, sdtw)
-
-        # Verify the results
-        assert torch.allclose(forward_cpu, forward_gpu.cpu())
-        assert torch.allclose(backward_cpu, backward_gpu.cpu(), atol=tol_backward)
-
-        if i > 0:  # Ignore the first time we run, in case this is a cold start (because timings are off at a cold start of the script)
-            times_cpu += [t_cpu]
-            times_gpu += [t_gpu]
-
-    # Average and log
-    avg_cpu = np.mean(times_cpu)
-    avg_gpu = np.mean(times_gpu)
-    print("  CPU:     ", avg_cpu)
-    print("  GPU:     ", avg_gpu)
-    print("  Speedup: ", avg_cpu / avg_gpu)
-    print()
-
-# ----------------------------------------------------------------------------------------------------------------------
-if __name__ == "__main__":
-    from timeit import default_timer as timer
-
-    torch.manual_seed(1234)
-
-    profile(128, 17, 15, 2, tol_backward=1e-6)
-    profile(512, 64, 64, 2, tol_backward=1e-4)
-    profile(512, 256, 256, 2, tol_backward=1e-3)
